@@ -11,6 +11,30 @@ There were no git tags for 1.0.0–1.4.0; 1.5.0 is the first cut named as a rele
 
 ### Added
 
+- **NVMe-direct KV prefix cache with a model-keyed fence** (lab boot:
+  `overlay/kvoffload/nvme_direct2.py`, `overlay/patch_kv_offload_groups.py`,
+  `tests/test_nvme_direct2.py`, `docs/nvme-prefix-fence.md`, `OFFLOAD_NVME=1`
+  arm in `start.sh`). Streams GPU<->file with no CPU tier (GB10 has none to
+  spare) and keeps a persistent block tree - one file per KV block, pinned
+  bounce buffers, event-fenced D2H -> fsync -> atomic rename - so a restart
+  restores long prefixes instead of recomputing them: 105k tokens, 1.68 GB
+  read, 5.5 s vs a 130 s recompute, bit-exact ids; a 6x168k flood stored
+  76.5 GB at min 4.6 GB head headroom with zero stalls. The tree outlives
+  the boot, so it is partitioned by sha256 over everything that changes the
+  meaning of stored bytes (model id, resolved weights revision,
+  kv_bytes_per_block from the broadcast kv_cache_config - NOT model.dtype,
+  which is process-dependent params dtype on this fork, hash/chunk geometry,
+  parallel sizes, per-group block sizes + layer names, engine version,
+  recipe stamp, format); config.json is written beside the data and READ
+  BACK at init, mismatch or sidecar-less data refuses to boot, and an
+  unresolvable revision lands in an isolated cold namespace, never merged.
+  That gate is #57 failure-mode 4 (stale weights -> confidently wrong
+  output) closed: boot with a wrong revision and the cache goes cold-recompute
+  with ids still matching; rebuild the image and the stamp axis does the
+  same. Rewrites upstream #232 (whose worker shape it keeps, short-write and
+  stale-positive findings fixed) on top of #230. Enforces PYTHONHASHSEED=0
+  and strips expandable_segments while on; GLM53_APC_NO_STORE stays
+  compatible (GPU hash insertion only). Poison knob: OFFLOAD_NVME_REVISION.
 - **Cold load at the NVMe ceiling on UMA / 64 KiB-page hosts**
   (`overlay/patch_cold_load_uma.py`, `tests/test_cold_load_uma.py`,
   `docs/cold-load-uma.md`). On GB10 `cuda.mem_get_info()` free is host
