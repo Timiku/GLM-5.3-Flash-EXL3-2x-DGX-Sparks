@@ -229,6 +229,8 @@ XGRAMMAR_PATCH_HOST="${XGRAMMAR_PATCH_HOST:-$SCRIPT_DIR/overlay/patch_xgrammar_t
 CACHE_RESET_PATCH_HOST="${CACHE_RESET_PATCH_HOST:-$SCRIPT_DIR/overlay/patch_cache_reset.py}"
 COLD_LOAD_PATCH_HOST="${COLD_LOAD_PATCH_HOST:-$SCRIPT_DIR/overlay/patch_cold_load_uma.py}"
 KPOOL_TAIL_PATCH_HOST="${KPOOL_TAIL_PATCH_HOST:-$SCRIPT_DIR/overlay/patch_kpool_tail_slotmap.py}"
+KVOFF_PATCH_HOST="${KVOFF_PATCH_HOST:-$SCRIPT_DIR/overlay/patch_kv_offload_groups.py}"
+NVME_SPEC_HOST="${NVME_SPEC_HOST:-$SCRIPT_DIR/overlay/kvoffload/nvme_direct2.py}"
 SPINWAIT_PATCH_HOST="${SPINWAIT_PATCH_HOST:-$SCRIPT_DIR/overlay/patch_spinwait.py}"
 ADAPTIVE_K_PATCH_HOST="${ADAPTIVE_K_PATCH_HOST:-$SCRIPT_DIR/overlay/patch_adaptive_k.py}"
 DENSE_FP8_PATCH_HOST="${DENSE_FP8_PATCH_HOST:-$SCRIPT_DIR/overlay/patch_dense_fp8.py}"
@@ -733,6 +735,7 @@ validate_overlay_artifacts() {
         "$TOOLCHOICE_PATCH_HOST|[glm53-tool-choice-none]|$main_guard"
         "$XGRAMMAR_PATCH_HOST|vllm/v1/structured_output/|$main_guard"
         "$KPOOL_TAIL_PATCH_HOST|[glm53-kpool-tail-slotmap]|$main_guard"
+        "$KVOFF_PATCH_HOST|[glm53-kv-offload-scratch]|$main_guard"
         "$SPINWAIT_PATCH_HOST|device_communicators/shm_broadcast.py|$main_guard"
         "$ADAPTIVE_K_PATCH_HOST|[glm53-adaptive-k]|$main_guard"
         "$DENSE_FP8_PATCH_HOST|[glm53-dense-fp8]|$main_guard"
@@ -1105,6 +1108,7 @@ preflight() {
     [ -f "$CACHE_RESET_PATCH_HOST" ] || die "$CACHE_RESET_PATCH_HOST missing"
     [ -f "$COLD_LOAD_PATCH_HOST" ] || die "$COLD_LOAD_PATCH_HOST missing"
     [ -f "$KPOOL_TAIL_PATCH_HOST" ] || die "$KPOOL_TAIL_PATCH_HOST missing"
+    [ -f "$KVOFF_PATCH_HOST" ] || die "$KVOFF_PATCH_HOST missing"
     [ -f "$SPINWAIT_PATCH_HOST" ] || die "$SPINWAIT_PATCH_HOST missing"
     [ -f "$ADAPTIVE_K_PATCH_HOST" ] || die "$ADAPTIVE_K_PATCH_HOST missing"
     [ -f "$DENSE_FP8_PATCH_HOST" ] || die "$DENSE_FP8_PATCH_HOST missing"
@@ -1607,6 +1611,7 @@ GLM53_OVERLAY_ORDER=(
     patch_tool_choice_none.py
     patch_xgrammar_termination.py
     patch_kpool_tail_slotmap.py
+    patch_kv_offload_groups.py
     patch_spinwait.py
     patch_adaptive_k.py
     patch_dense_fp8.py
@@ -1630,6 +1635,12 @@ write_inner_scripts() {
 #!/bin/bash
 set -euo pipefail
 say() { echo "[glm53-exl3-head] $*"; }
+
+# Out-of-tree KV offload spec visibility (OFFLOAD_NVME; harmless otherwise).
+if [ -d /opt/glm53/kvoffload ]; then
+    PYTHONPATH="/opt/glm53${PYTHONPATH:+:$PYTHONPATH}"
+    export PYTHONPATH
+fi
 
 ARGS=(
     --served-model-name "${SERVED_MODEL_NAME}"
@@ -1710,6 +1721,12 @@ EOF
 set -euo pipefail
 say() { echo "[glm53-exl3-worker] $*"; }
 
+
+# Out-of-tree KV offload spec visibility (OFFLOAD_NVME; harmless otherwise).
+if [ -d /opt/glm53/kvoffload ]; then
+    PYTHONPATH="/opt/glm53${PYTHONPATH:+:$PYTHONPATH}"
+    export PYTHONPATH
+fi
 ARGS=(
     --served-model-name "${SERVED_MODEL_NAME}"
     --host 0.0.0.0
@@ -1897,6 +1914,52 @@ launch_cluster() {
     scp -q -o BatchMode=yes "$COLD_LOAD_PATCH_HOST" "${WORKER_SSH}:/tmp/patch_cold_load_uma.py"
     [ -f "$KPOOL_TAIL_PATCH_HOST" ] || die "missing $KPOOL_TAIL_PATCH_HOST"
     scp -q -o BatchMode=yes "$KPOOL_TAIL_PATCH_HOST" "${WORKER_SSH}:/tmp/patch_kpool_tail_slotmap.py"
+    [ -f "$KVOFF_PATCH_HOST" ] || die "missing $KVOFF_PATCH_HOST"
+    scp -q -o BatchMode=yes "$KVOFF_PATCH_HOST" "${WORKER_SSH}:/tmp/patch_kv_offload_groups.py"
+    local -a nvme_head_vol=()
+    local nvme_worker_vol="" nvme_json=""
+    if [ "${OFFLOAD_NVME:-0}" = "1" ]; then
+        # GPU<->NVMe direct KV offload (out-of-tree NvmeDirectOffloadingSpec2,
+        # overlay/kvoffload/). Each node keeps its own fenced file tree on its
+        # NVMe root (deliberately OUTSIDE the vllm cache dirs so cache
+        # eviction sweeps never touch it). The connector args ride EXTRA_ARGS;
+        # the allocator/HASHSEED overrides ride nccl_common below.
+        [ -f "$NVME_SPEC_HOST" ] || die "OFFLOAD_NVME=1: spec $NVME_SPEC_HOST missing"
+        # GLM53_APC_NO_STORE is compatible by design: it suppresses GPU hash
+        # INSERTION for flagged requests only; the connector keys off
+        # Request.block_hashes, which that patch keeps intact.
+        case "${EXTRA_ARGS:-}" in
+            *--kv-transfer-config*) die "OFFLOAD_NVME=1 conflicts with an EXTRA_ARGS kv-transfer-config";;
+        esac
+        NVME_ROOT="${OFFLOAD_NVME_ROOT:-$HOME/glm53-kv}"
+        NVME_ROOT_WORKER="${OFFLOAD_NVME_ROOT_WORKER:-$WORKER_HOME/glm53-kv}"
+        NVME_CONTAINER_ROOT="${OFFLOAD_NVME_CONTAINER_ROOT:-/mnt/glm53-kv}"
+        NVME_CAPACITY="${OFFLOAD_NVME_CAPACITY_BYTES:-536870912000}"
+        _fst=$(stat -f -c %T "$NVME_ROOT" 2>/dev/null || echo unknown)
+        case "$_fst" in
+            tmpfs|ramfs) die "OFFLOAD_NVME=1: $NVME_ROOT lives on $_fst — point OFFLOAD_NVME_ROOT at NVMe";;
+        esac
+        mkdir -p "$NVME_ROOT" || die "cannot create $NVME_ROOT"
+        _av=$(df -B1 --output=avail "$NVME_ROOT" | awk 'NF && $1 ~ /^[0-9]+$/ {v=$1} END{print v+0}')
+        [ "${_av:-0}" -ge "$NVME_CAPACITY" ] \
+            || die "head: $NVME_ROOT has ${_av:-?} B free; NVME_CAPACITY=$NVME_CAPACITY"
+        worker_ssh "mkdir -p '$NVME_ROOT_WORKER' && rm -f /tmp/glm53-nvme_direct2.py" \
+            || die "cannot prepare $NVME_ROOT_WORKER on worker"
+        _av=$(worker_ssh "df -B1 --output=avail '$NVME_ROOT_WORKER'" | awk 'NF && $1 ~ /^[0-9]+$/ {v=$1} END{print v+0}')
+        [ "${_av:-0}" -ge "$NVME_CAPACITY" ] \
+            || die "worker: $NVME_ROOT_WORKER has ${_av:-?} B free; NVME_CAPACITY=$NVME_CAPACITY"
+        scp -q -o BatchMode=yes "$NVME_SPEC_HOST" "${WORKER_SSH}:/tmp/glm53-nvme_direct2.py" \
+            || die "failed to stage nvme_direct2.py on worker"
+        nvme_head_vol=(
+            -v "$NVME_ROOT:$NVME_CONTAINER_ROOT"
+            -v "$NVME_SPEC_HOST:/opt/glm53/kvoffload/nvme_direct2.py:ro"
+        )
+        nvme_worker_vol="-v '$NVME_ROOT_WORKER:$NVME_CONTAINER_ROOT' -v '/tmp/glm53-nvme_direct2.py:/opt/glm53/kvoffload/nvme_direct2.py:ro'"
+        # compact JSON (no spaces): EXTRA=(${EXTRA_ARGS}) word-splits verbatim
+        nvme_json="{\"kv_connector\":\"OffloadingConnector\",\"kv_role\":\"kv_both\",\"kv_connector_extra_config\":{\"spec_name\":\"NvmeDirectOffloadingSpec2\",\"spec_module_path\":\"kvoffload.nvme_direct2\",\"root_dir\":\"$NVME_CONTAINER_ROOT\",\"model_name\":\"$MODEL\",\"model_revision\":\"${OFFLOAD_NVME_REVISION:-${MODEL_REVISION:-}}\",\"capacity_bytes\":${NVME_CAPACITY},\"n_io_threads\":${OFFLOAD_NVME_THREADS:-6}}}"
+        EXTRA_ARGS="${EXTRA_ARGS:+$EXTRA_ARGS }--kv-transfer-config $nvme_json"
+        log "KV offload: NVMe-direct ON (root=$NVME_ROOT, worker=$NVME_ROOT_WORKER, capacity=$((NVME_CAPACITY/1024/1024/1024)) GiB)"
+    fi
     [ -f "$SPINWAIT_PATCH_HOST" ] || die "missing $SPINWAIT_PATCH_HOST"
     scp -q -o BatchMode=yes "$SPINWAIT_PATCH_HOST" "${WORKER_SSH}:/tmp/patch_spinwait.py"
     [ -f "$ADAPTIVE_K_PATCH_HOST" ] || die "missing $ADAPTIVE_K_PATCH_HOST"
@@ -1944,6 +2007,8 @@ launch_cluster() {
         -e "GLM53_SPINWAIT_MS=$GLM53_SPINWAIT_MS"
         -e "TRITON_CACHE_DIR=$TRITON_CACHE_DIR"
         -e "TILELANG_CACHE_DIR=$TILELANG_CACHE_DIR"
+        -e "GLM53_OFFLOAD_MMAP_DIR=${GLM53_OFFLOAD_MMAP_DIR:-}"
+        -e "GLM53_OFFLOAD_RELEASE_BYTES=${GLM53_OFFLOAD_RELEASE_BYTES:-}"
         -e "VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS=$VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS"
         -e "TORCH_CUDA_ARCH_LIST=$TORCH_CUDA_ARCH_LIST"
         -e "FLASHINFER_CUDA_ARCH_LIST=$FLASHINFER_CUDA_ARCH_LIST"
@@ -1958,6 +2023,24 @@ launch_cluster() {
         -e DO_NOT_TRACK=1
         -e "VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS=$CG_ESTIMATE"
     )
+    if [ "${OFFLOAD_NVME:-0}" = "1" ]; then
+        # Cross-boot key stability (NvmeDirectOffloadingSpec2):
+        #  * PYTHONHASHSEED=0 pins NONE_HASH — seed-random otherwise, every
+        #    stored hash would die at the next boot.
+        #  * expandable_segments is stripped: config/vllm.py refuses any KV
+        #    connector under it unless cumem is on, and cumem's whole point is
+        #    a CPU staging tier this arm deliberately has no use for.
+        local nvme_alloc="${PYTORCH_CUDA_ALLOC_CONF-expandable_segments:True}"
+        nvme_alloc="${nvme_alloc//expandable_segments:True/}"
+        nvme_alloc="${nvme_alloc#,}"
+        nccl_common+=(
+            -e "PYTHONHASHSEED=0"
+            -e "PYTORCH_CUDA_ALLOC_CONF=${nvme_alloc}"
+            -e "GLM53_RECIPE_STAMP=$(image_recipe_stamp)"
+            -e "MODEL_REVISION=${MODEL_REVISION:-}"
+        )
+        log "nvme-offload env: PYTHONHASHSEED=0, allocator=$([ -n "$nvme_alloc" ] && echo "$nvme_alloc" || echo torch-default)"
+    fi
     if [ -n "${NCCL_NCHANNELS:-}" ]; then
         [[ "$NCCL_NCHANNELS" =~ ^[1-9][0-9]*$ ]] || die "NCCL_NCHANNELS must be a positive integer (got ${NCCL_NCHANNELS})"
         nccl_common+=(
@@ -2097,6 +2180,7 @@ launch_cluster() {
         -v '/tmp/patch_cache_reset.py:/opt/glm53/patch_cache_reset.py:ro' \
         -v '/tmp/patch_cold_load_uma.py:/opt/glm53/patch_cold_load_uma.py:ro' \
         -v '/tmp/patch_kpool_tail_slotmap.py:/opt/glm53/patch_kpool_tail_slotmap.py:ro' \
+        -v '/tmp/patch_kv_offload_groups.py:/opt/glm53/patch_kv_offload_groups.py:ro' \
         -v '/tmp/patch_spinwait.py:/opt/glm53/patch_spinwait.py:ro' \
         -v '/tmp/patch_adaptive_k.py:/opt/glm53/patch_adaptive_k.py:ro' \
         -v '/tmp/patch_dense_fp8.py:/opt/glm53/patch_dense_fp8.py:ro' \
@@ -2104,6 +2188,7 @@ launch_cluster() {
         -v '/tmp/glm53-exl3.py:/opt/glm53/exl3.py:ro' \
         -v '/tmp/glm53-ablit:/opt/glm53/ablit:ro' \
         -v '/tmp/glm53-ablit_runtime.py:/opt/glm53/ablit_runtime.py:ro' \
+        ${nvme_worker_vol} \
         -v '/tmp/patch_ablit.py:/opt/glm53/patch_ablit.py:ro' \
         ${worker_preload} \
         ${worker_nccl} \
@@ -2139,6 +2224,7 @@ launch_cluster() {
         -v "$CACHE_RESET_PATCH_HOST:/opt/glm53/patch_cache_reset.py:ro" \
         -v "$COLD_LOAD_PATCH_HOST:/opt/glm53/patch_cold_load_uma.py:ro" \
         -v "$KPOOL_TAIL_PATCH_HOST:/opt/glm53/patch_kpool_tail_slotmap.py:ro" \
+        -v "$KVOFF_PATCH_HOST:/opt/glm53/patch_kv_offload_groups.py:ro" \
         -v "$SPINWAIT_PATCH_HOST:/opt/glm53/patch_spinwait.py:ro" \
         -v "$ADAPTIVE_K_PATCH_HOST:/opt/glm53/patch_adaptive_k.py:ro" \
         -v "$DENSE_FP8_PATCH_HOST:/opt/glm53/patch_dense_fp8.py:ro" \
@@ -2146,6 +2232,7 @@ launch_cluster() {
         -v "$EXL3_OVERLAY_HOST:/opt/glm53/exl3.py:ro" \
         -v "$SCRIPT_DIR/ablit:/opt/glm53/ablit:ro" \
         -v "$SCRIPT_DIR/overlay/ablit_runtime.py:/opt/glm53/ablit_runtime.py:ro" \
+        "${nvme_head_vol[@]}" \
         -v "$SCRIPT_DIR/overlay/patch_ablit.py:/opt/glm53/patch_ablit.py:ro" \
         "${head_preload[@]}" \
         "${nccl_common[@]}" \
