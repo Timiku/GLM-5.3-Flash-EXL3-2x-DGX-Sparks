@@ -230,6 +230,7 @@ CACHE_RESET_PATCH_HOST="${CACHE_RESET_PATCH_HOST:-$SCRIPT_DIR/overlay/patch_cach
 COLD_LOAD_PATCH_HOST="${COLD_LOAD_PATCH_HOST:-$SCRIPT_DIR/overlay/patch_cold_load_uma.py}"
 KPOOL_TAIL_PATCH_HOST="${KPOOL_TAIL_PATCH_HOST:-$SCRIPT_DIR/overlay/patch_kpool_tail_slotmap.py}"
 KVOFF_PATCH_HOST="${KVOFF_PATCH_HOST:-$SCRIPT_DIR/overlay/patch_kv_offload_groups.py}"
+INDEXER_WARMUP_PATCH_HOST="${INDEXER_WARMUP_PATCH_HOST:-$SCRIPT_DIR/overlay/patch_indexer_warmup_range.py}"
 NVME_SPEC_HOST="${NVME_SPEC_HOST:-$SCRIPT_DIR/overlay/kvoffload/nvme_direct2.py}"
 SPINWAIT_PATCH_HOST="${SPINWAIT_PATCH_HOST:-$SCRIPT_DIR/overlay/patch_spinwait.py}"
 ADAPTIVE_K_PATCH_HOST="${ADAPTIVE_K_PATCH_HOST:-$SCRIPT_DIR/overlay/patch_adaptive_k.py}"
@@ -1617,6 +1618,7 @@ GLM53_OVERLAY_ORDER=(
     patch_dense_fp8.py
     patch_default_max_new_tokens.py
     patch_indexer_workspace.py
+    patch_indexer_warmup_range.py
     patch_cache_reset.py
     patch_ablit.py
 )
@@ -1916,6 +1918,8 @@ launch_cluster() {
     scp -q -o BatchMode=yes "$KPOOL_TAIL_PATCH_HOST" "${WORKER_SSH}:/tmp/patch_kpool_tail_slotmap.py"
     [ -f "$KVOFF_PATCH_HOST" ] || die "missing $KVOFF_PATCH_HOST"
     scp -q -o BatchMode=yes "$KVOFF_PATCH_HOST" "${WORKER_SSH}:/tmp/patch_kv_offload_groups.py"
+    [ -f "$INDEXER_WARMUP_PATCH_HOST" ] || die "missing $INDEXER_WARMUP_PATCH_HOST"
+    scp -q -o BatchMode=yes "$INDEXER_WARMUP_PATCH_HOST" "${WORKER_SSH}:/tmp/patch_indexer_warmup_range.py"
     local -a nvme_head_vol=()
     local nvme_worker_vol="" nvme_json=""
     if [ "${OFFLOAD_NVME:-0}" = "1" ]; then
@@ -2181,6 +2185,7 @@ launch_cluster() {
         -v '/tmp/patch_cold_load_uma.py:/opt/glm53/patch_cold_load_uma.py:ro' \
         -v '/tmp/patch_kpool_tail_slotmap.py:/opt/glm53/patch_kpool_tail_slotmap.py:ro' \
         -v '/tmp/patch_kv_offload_groups.py:/opt/glm53/patch_kv_offload_groups.py:ro' \
+        -v '/tmp/patch_indexer_warmup_range.py:/opt/glm53/patch_indexer_warmup_range.py:ro' \
         -v '/tmp/patch_spinwait.py:/opt/glm53/patch_spinwait.py:ro' \
         -v '/tmp/patch_adaptive_k.py:/opt/glm53/patch_adaptive_k.py:ro' \
         -v '/tmp/patch_dense_fp8.py:/opt/glm53/patch_dense_fp8.py:ro' \
@@ -2225,6 +2230,7 @@ launch_cluster() {
         -v "$COLD_LOAD_PATCH_HOST:/opt/glm53/patch_cold_load_uma.py:ro" \
         -v "$KPOOL_TAIL_PATCH_HOST:/opt/glm53/patch_kpool_tail_slotmap.py:ro" \
         -v "$KVOFF_PATCH_HOST:/opt/glm53/patch_kv_offload_groups.py:ro" \
+        -v "$INDEXER_WARMUP_PATCH_HOST:/opt/glm53/patch_indexer_warmup_range.py:ro" \
         -v "$SPINWAIT_PATCH_HOST:/opt/glm53/patch_spinwait.py:ro" \
         -v "$ADAPTIVE_K_PATCH_HOST:/opt/glm53/patch_adaptive_k.py:ro" \
         -v "$DENSE_FP8_PATCH_HOST:/opt/glm53/patch_dense_fp8.py:ro" \

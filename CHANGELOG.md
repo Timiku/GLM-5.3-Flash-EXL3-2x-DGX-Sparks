@@ -11,6 +11,25 @@ There were no git tags for 1.0.0–1.4.0; 1.5.0 is the first cut named as a rele
 
 ### Added
 
+- **Indexer warmup-range widening: no mid-serve JIT spike on big prefills**
+  (`overlay/patch_indexer_warmup_range.py`, `tests/test_indexer_warmup_range.py`,
+  adapted from upstream #203, which conflicts against current `main`).
+  `BuildPrefillChunkMetadataKernel.get_warmup_keys` enumerated
+  `query_slice_start=WarmupIntRange(0, 2)` — the range is exclusive, so boot
+  warmup covered Triton's `==1`-folded and `%16==0` buckets but never the
+  third int bucket. Runtime sub-chunk offsets (`max_q` at >~75k uncompressed
+  tokens under the 512 MiB logits budget, `index_kpool=4`, MNBT=7168 — all
+  this recipe's values) land there: the first big prefill after a restart
+  paid a cold Triton compile mid-serve (9 `jit_monitor` warnings on the
+  09-19 boot10 log, one of them exactly this kernel). The patch widens the
+  range to `(0, 3)`, a content-only edit below the `@triton.jit` kernel so
+  the persistent Triton cache stays valid; fail-closed anchors on drift.
+  Delivered both ways: baked (Dockerfile RUN) and boot-time bind-mount +
+  apply block (`INDEXER_WARMUP_PATCH_HOST`), so a running-image rig gets it
+  without a rebuild. Verified on this pair: patch applies to the live
+  installed `indexer.py` copy (apply, idempotence, drift-refusal probes in
+  a throwaway container of the real image); 9 host tests green.
+
 - **NVMe-direct KV prefix cache with a model-keyed fence** (lab boot:
   `overlay/kvoffload/nvme_direct2.py`, `overlay/patch_kv_offload_groups.py`,
   `tests/test_nvme_direct2.py`, `docs/nvme-prefix-fence.md`, `OFFLOAD_NVME=1`
