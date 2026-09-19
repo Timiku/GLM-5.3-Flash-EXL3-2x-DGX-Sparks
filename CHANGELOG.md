@@ -19,9 +19,25 @@ There were no git tags for 1.0.0–1.4.0; 1.5.0 is the first cut named as a rele
   warmup covered Triton's `==1`-folded and `%16==0` buckets but never the
   third int bucket. Runtime sub-chunk offsets (`max_q` at >~75k uncompressed
   tokens under the 512 MiB logits budget, `index_kpool=4`, MNBT=7168 — all
-  this recipe's values) land there: the first big prefill after a restart
-  paid a cold Triton compile mid-serve (9 `jit_monitor` warnings on the
-  09-19 boot10 log, one of them exactly this kernel). The patch widens the
+  this recipe's values) land there: a cold cache pays a mid-serve compile the
+  first time traffic hits the bucket (the pair's own Triton cache shows 4
+  such variants compiled during serving on 09-18, before this patch existed).
+  Counting note: the earlier "boot10 log showed the spike" claim was a grep
+  artifact — the monitor emits one activation banner per boot whose phrasing
+  matches the count pattern; real warnings say "compilation during inference:"
+  and boot10 has zero. Cold-cache A/B (per-arm cache aside): stock boots warm
+  24 indexer.py:288 variants, patched boots the same 24 plus exactly the 12
+  the widened range adds, all inside the boot window; three fresh 90k
+  single-request prefills on the stock arm: TTFT 78-82 s, zero post-boot
+  writes to its cache. The patched arm's probes restore-hit a shared NVMe
+  tree (5.7 s) - a wave flaw, no clean patched-arm TTFT; the boot-side
+  compile counts are unaffected. The mid-serve compile upstream records IS
+  real on this pair's own disk: 4 of the 12 variants carry serving-window
+  mtimes from 09-18, before the patch existed (which request shape hit them
+  is unrecorded; the fresh single-request 90k probes never reach the
+  bucket, so it is rarer than "first big prefill after a restart"). Verdict: cold-cache
+  insurance, +~2 min boot, no measurable serving delta while the persistent
+  cache stands; keep it (free), do not quote a speed win. The patch widens the
   range to `(0, 3)`, a content-only edit below the `@triton.jit` kernel so
   the persistent Triton cache stays valid; fail-closed anchors on drift.
   Delivered both ways: baked (Dockerfile RUN) and boot-time bind-mount +
