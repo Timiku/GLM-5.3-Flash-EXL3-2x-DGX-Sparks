@@ -58,6 +58,8 @@
 # never reads that file. Shared tokens/IPs can stay in .env.
 # ============================================================================
 set -euo pipefail
+# Non-login environments (cron, some service managers) may omit USER; default to the effective account. #197
+USER="${USER:-$(id -un)}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"
 
@@ -110,6 +112,7 @@ _cli_apc_swa_set="${GLM53_APC_RETENTION_INTERVAL_SWA+1}"
 _cli_apc_swa="${GLM53_APC_RETENTION_INTERVAL_SWA-}"
 _cli_overlay="${EXL3_OVERLAY_HOST-}"
 _cli_dense_fp8="${GLM53_DENSE_FP8-}"
+_cli_kda_bf16="${GLM53_KDA_BF16_LARGE_M-}"
 set -a
 # shellcheck disable=SC1091
 source "$SCRIPT_DIR/.env"
@@ -120,7 +123,8 @@ ABLIT=0
 # adapter (wrong ABI). Set EXL3_OVERLAY_HOST in .env.tp3 (or on the command
 # line) to opt in to a TP3-generated overlay.
 unset EXL3_OVERLAY_HOST
-# FAST/FAT (#182) stay on start.sh (TP=2) only.
+# Thin-decode FAST and the #182 W8A8 FAT path stay on start.sh (TP=2) only.
+# GLM53_KDA_BF16_LARGE_M (#233) is overlay-side and is valid on TP=3.
 unset GLM53_EXL3_MOE_FAST
 unset GLM53_KDA_FP8_FAT
 # TP=3 overlay wins over the 2× knobs in .env.
@@ -156,6 +160,7 @@ set +a
 [ -n "${_cli_apc_swa_set}" ] && GLM53_APC_RETENTION_INTERVAL_SWA="$_cli_apc_swa"
 [ -n "${_cli_overlay}" ] && EXL3_OVERLAY_HOST="$_cli_overlay"
 [ -n "${_cli_dense_fp8}" ] && GLM53_DENSE_FP8="$_cli_dense_fp8"
+[ -n "${_cli_kda_bf16}" ] && GLM53_KDA_BF16_LARGE_M="$_cli_kda_bf16"
 
 # ----------------------------- configuration -------------------------------
 MODEL="${MODEL:-Mia-AiLab/GLM-5.3-Flash-EXL3-TR3-4bpw}"
@@ -323,6 +328,9 @@ GLM53_ADAPTIVE_K_MIN_STEPS="${GLM53_ADAPTIVE_K_MIN_STEPS:-4}"
 GLM53_ADAPTIVE_K_SATURATE="${GLM53_ADAPTIVE_K_SATURATE:-max}"
 GLM53_ADAPTIVE_K_HIST="${GLM53_ADAPTIVE_K_HIST:-200}"
 GLM53_DENSE_FP8="${GLM53_DENSE_FP8:-dense,kda}"
+# Large-M KDA BF16 prefill (overlay/exl3.py). Requires kda in GLM53_DENSE_FP8.
+# TP3-local in_proj is [8726x4096] (64→66 head pad). Default off.
+GLM53_KDA_BF16_LARGE_M="${GLM53_KDA_BF16_LARGE_M-0}"
 # Cooperative MoE tile geometry (0 both-narrow, 1 both-wide, 2 A-wide/B-narrow).
 # Empty uses the adapter default (1). Must be identical on all ranks and set
 # before native prepare / CUDA-graph capture; it is not a live graph switch.
@@ -662,6 +670,7 @@ validate_numeric_config() {
             echo "$loader_key must be an integer" >&2; return 2
         fi
     done
+    _glm53_validate_enum GLM53_KDA_BF16_LARGE_M "${GLM53_KDA_BF16_LARGE_M-0}" 0 1 || return
     _glm53_validate_enum HAREM_KDA_FLASHKDA "$HAREM_KDA_FLASHKDA" 0 1 || return
     if [ "$HAREM_KDA_FLASHKDA" = 1 ] && [ ! -f "$FLASHKDA_PATCH_HOST" ]; then
         echo "FlashKDA patch missing: $FLASHKDA_PATCH_HOST" >&2; return 2
@@ -1967,7 +1976,7 @@ TP3_SKIP_OLD_SCP
              ABLIT ABLIT_METHOD ABLIT_DIRECTION ABLIT_LAYERS ABLIT_ALPHA ABLIT_INCLUDE_MTP \
              GLM53_ADAPTIVE_K GLM53_ADAPTIVE_K_SET GLM53_ADAPTIVE_K_ALPHA GLM53_ADAPTIVE_K_MARGIN \
              GLM53_ADAPTIVE_K_MIN_STEPS GLM53_ADAPTIVE_K_SATURATE GLM53_ADAPTIVE_K_HIST GLM53_DENSE_FP8 \
-             GLM53_COOP_GEOMETRY HAREM_KDA_FLASHKDA; do
+             GLM53_KDA_BF16_LARGE_M GLM53_COOP_GEOMETRY HAREM_KDA_FLASHKDA; do
         serve_env+=" -e $v='${!v:-}'"
     done
     # Optional loader tuning is forwarded only when supplied; image defaults
@@ -2113,6 +2122,7 @@ TP3_SKIP_OLD_SCP
         -e GLM53_ADAPTIVE_K_SATURATE="$GLM53_ADAPTIVE_K_SATURATE" \
         -e GLM53_ADAPTIVE_K_HIST="$GLM53_ADAPTIVE_K_HIST" \
         -e GLM53_DENSE_FP8="$GLM53_DENSE_FP8" \
+        -e GLM53_KDA_BF16_LARGE_M="$GLM53_KDA_BF16_LARGE_M" \
         -e GLM53_COOP_GEOMETRY="$GLM53_COOP_GEOMETRY" \
         -e MM_IMAGE_TOKENS="${MM_IMAGE_TOKENS:-}" \
         -e VIDEO_NUM_FRAMES="${VIDEO_NUM_FRAMES:-}" \
@@ -2287,7 +2297,7 @@ start() {
         log "DFlash2 load path (in-container): ${DFLASH_MODEL_DIR}"
     fi
     log "model load path (in-container): ${MODEL_DIR}"
-    log "config: image=${IMAGE} tp=${TP} nnodes=${NNODES} quant=${QUANTIZATION} spec=${SPEC_METHOD} mtp=${MTP_TOKENS} dflash_k=${DFLASH_TOKENS} max-len=${MAX_MODEL_LEN} gpu-util=${GPU_MEM_UTIL} kv=${KV_CACHE_DTYPE} lm-only=${LANGUAGE_MODEL_ONLY} port=${PORT} adaptive-k=${GLM53_ADAPTIVE_K} set=${GLM53_ADAPTIVE_K_SET} alpha=${GLM53_ADAPTIVE_K_ALPHA} dense_fp8=${GLM53_DENSE_FP8} overlay=${EXL3_OVERLAY_HOST} coop_geometry=${GLM53_COOP_GEOMETRY:-} flashkda=${HAREM_KDA_FLASHKDA} fat_grouped=${EXL3_FAT_GROUPED} temp_rows=${EXL3_TEMP_ROWS_FUSED}"
+    log "config: image=${IMAGE} tp=${TP} nnodes=${NNODES} quant=${QUANTIZATION} spec=${SPEC_METHOD} mtp=${MTP_TOKENS} dflash_k=${DFLASH_TOKENS} max-len=${MAX_MODEL_LEN} gpu-util=${GPU_MEM_UTIL} kv=${KV_CACHE_DTYPE} lm-only=${LANGUAGE_MODEL_ONLY} port=${PORT} adaptive-k=${GLM53_ADAPTIVE_K} set=${GLM53_ADAPTIVE_K_SET} alpha=${GLM53_ADAPTIVE_K_ALPHA} dense_fp8=${GLM53_DENSE_FP8} kda_bf16=${GLM53_KDA_BF16_LARGE_M} overlay=${EXL3_OVERLAY_HOST} coop_geometry=${GLM53_COOP_GEOMETRY:-} flashkda=${HAREM_KDA_FLASHKDA} fat_grouped=${EXL3_FAT_GROUPED} temp_rows=${EXL3_TEMP_ROWS_FUSED}"
 
     launch_cluster
     if wait_for_health; then

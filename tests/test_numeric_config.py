@@ -8,6 +8,8 @@ import subprocess
 import tempfile
 from pathlib import Path
 
+import pytest
+
 
 ROOT = Path(__file__).resolve().parents[1]
 START = ROOT / "start.sh"
@@ -228,24 +230,165 @@ def test_thin_decode_flag_rejects_bad_values_before_host_actions() -> None:
             assert not harness.host_touching_calls(), (value, harness.calls())
 
 
-def test_tp4_rejects_retention_override() -> None:
+def test_kda_bf16_large_m_flag_rejects_bad_values_before_host_actions() -> None:
+    """GLM53_KDA_BF16_LARGE_M is exactly 0/1 and validated before any stop.
+
+    ``overlay/exl3.py`` refuses anything else at model load, so a typo must
+    not cost a running pair.
+    """
+    from test_launcher_rank_parity import Harness
+
+    with tempfile.TemporaryDirectory() as directory:
+        harness = Harness(Path(directory))
+        for value in ("0", "1"):
+            result = harness.run(
+                "validate_numeric_config", entry="start.fn.sh",
+                GLM53_KDA_BF16_LARGE_M=value)
+            assert result.returncode == 0, (value, result.stderr)
+            assert not harness.host_touching_calls()
+        for value in ("", "yes", " 1", "1 ", "2", "true"):
+            result = harness.run("restart", GLM53_KDA_BF16_LARGE_M=value)
+            assert result.returncode == 2, (value, result.stderr)
+            assert "GLM53_KDA_BF16_LARGE_M" in result.stderr, value
+            assert not harness.host_touching_calls(), (value, harness.calls())
+
+
+def test_tp3_kda_bf16_large_m_flag_is_0_or_1() -> None:
+    """start-tp3.sh validates GLM53_KDA_BF16_LARGE_M before any stop."""
+    guard = guard_source(ROOT / "start-tp3.sh")
+    for value, expected in (("0", 0), ("1", 0), ("", 2), ("yes", 2), ("2", 2)):
+        script = (
+            guard
+            + '\nGLM53_KDA_BF16_LARGE_M="$1"\n'
+            + '_glm53_validate_enum GLM53_KDA_BF16_LARGE_M '
+            + '"$GLM53_KDA_BF16_LARGE_M" 0 1\n'
+        )
+        result = subprocess.run(
+            ["bash", "-c", script, "test", value],
+            capture_output=True, text=True)
+        assert result.returncode == expected, (value, result.stderr)
+        if expected:
+            assert "GLM53_KDA_BF16_LARGE_M" in result.stderr
+
+
+# #207 makes the prefix-cache retention intervals configurable on every launcher
+# (start.sh / start-tp3.sh / start-tp4.sh): "" (unset) and 0 pass, and a positive
+# value must sit on the 3584-token scheduler-block grid, at most 1e6.
+RETENTION_LAUNCHERS = (START, ROOT / "start-tp3.sh", START_TP4)
+RETENTION_OK = (None, "", "0", "14336", "03584", "999936")
+RETENTION_BAD = ("1", "-3584", "3584.0", "1003520")
+
+
+def coop_overlay_selected_source(launcher: Path) -> str:
+    """The real coop-overlay selector, for the launchers whose guard calls it.
+
+    start-tp3.sh's guard asks whether the selected overlay wants the
+    cooperative MoE runtime. ``EXL3_OVERLAY_HOST`` is unset here, so the real
+    function reports "not selected" and the guard skips that branch instead of
+    failing on a missing command.
+    """
+    source = launcher.read_text()
+    marker = "_glm53_coop_overlay_selected() {"
+    if marker not in source:
+        return ""
+    begin = source.index(marker)
+    return source[begin:source.index("\n}\n", begin) + 3] + "\n"
+
+
+def validate_retention(
+    launcher: Path, knob: str, value: str | None, spec_method: str = "none"
+) -> subprocess.CompletedProcess[str]:
+    """Run one launcher's own numeric guard with only ``knob`` set.
+
+    ``None`` leaves the knob unset, ``""`` exports it empty — the two are
+    distinct contracts ("inherit" vs "explicitly empty").
+    """
+    export = "" if value is None else 'export "$2=$3"\n'
     script = (
-        guard_source(START_TP4)
+        guard_source(launcher)
+        + "\n"
+        + coop_overlay_selected_source(launcher)
         + '\nGPU_MEM_UTIL=0.87; MAX_MODEL_LEN=1000000; MAX_NUM_SEQS=4; '
         + 'MAX_NUM_BATCHED_TOKENS=1024; GLM53_INDEXER_WORKSPACE=stock; '
-        + 'GLM53_SPINWAIT_MS=stock; export "$1=$2"\n'
-        + 'validate_numeric_config\n'
+        + 'GLM53_SPINWAIT_MS=stock; HAREM_KDA_FLASHKDA=0; SPEC_METHOD="$1"\n'
+        + export
+        + 'validate_numeric_config || exit $?\n'
+        + f'printf "%s\\n" "${{{knob}-unset}}"\n'
     )
-    for knob in ("GLM53_APC_RETENTION_INTERVAL", "GLM53_APC_RETENTION_INTERVAL_SWA"):
-        for value, expected in (("", 0), ("0", 2), ("14336", 2)):
-            result = subprocess.run(
-                ["bash", "-c", script, "test", knob, value],
-                text=True,
-                capture_output=True,
-                check=False,
-                env={**os.environ, "LC_ALL": "C"},
+    env = {
+        key: val
+        for key, val in os.environ.items()
+        if not key.startswith("GLM53_") and key != "SPEC_METHOD"
+    }
+    env["LC_ALL"] = "C"
+    return subprocess.run(
+        ["bash", "-c", script, "test", spec_method, knob, value or ""],
+        text=True,
+        capture_output=True,
+        check=False,
+        env=env,
+    )
+
+
+def canonical_retention(value: str | None) -> str:
+    """What the guard must hand to the ranks: unset stays unset, zeros stripped."""
+    if value is None:
+        return "unset"
+    if value == "":
+        return ""
+    return value.lstrip("0") or "0"
+
+
+@pytest.mark.parametrize("launcher", RETENTION_LAUNCHERS, ids=lambda path: path.name)
+def test_global_retention_interval_contract(launcher: Path) -> None:
+    """The global interval is a token count on the scheduler-block grid.
+
+    Invalid values return launcher error 2; accepted values are normalized by
+    the real guard before launch.
+    """
+    for value in RETENTION_OK:
+        result = validate_retention(launcher, "GLM53_APC_RETENTION_INTERVAL", value)
+        assert result.returncode == 0, (launcher, value, result.stderr)
+        assert result.stdout.strip() == canonical_retention(value), (launcher, value)
+    for value in RETENTION_BAD:
+        result = validate_retention(launcher, "GLM53_APC_RETENTION_INTERVAL", value)
+        assert result.returncode == 2, (launcher, value, result.stdout, result.stderr)
+        assert "GLM53_APC_RETENTION_INTERVAL" in result.stderr, (launcher, value)
+
+
+@pytest.mark.parametrize("launcher", RETENTION_LAUNCHERS, ids=lambda path: path.name)
+def test_swa_retention_interval_needs_the_dflash_drafter(launcher: Path) -> None:
+    """The SWA interval is the DFlash2 drafter's; anything else is refused.
+
+    Empty and unset stay valid for every speculator (they inherit the global
+    policy), while a set value requires ``SPEC_METHOD=dflash``.
+    """
+    for value in RETENTION_OK:
+        result = validate_retention(
+            launcher, "GLM53_APC_RETENTION_INTERVAL_SWA", value, spec_method="dflash"
+        )
+        assert result.returncode == 0, (launcher, value, result.stderr)
+        assert result.stdout.strip() == canonical_retention(value), (launcher, value)
+    for value in RETENTION_BAD:
+        result = validate_retention(
+            launcher, "GLM53_APC_RETENTION_INTERVAL_SWA", value, spec_method="dflash"
+        )
+        assert result.returncode == 2, (launcher, value, result.stdout, result.stderr)
+    for value in (None, ""):
+        result = validate_retention(
+            launcher, "GLM53_APC_RETENTION_INTERVAL_SWA", value, spec_method="mtp"
+        )
+        assert result.returncode == 0, (launcher, value, result.stderr)
+    for value in ("0", "3584"):
+        for spec_method in ("mtp", "none"):
+            result = validate_retention(
+                launcher,
+                "GLM53_APC_RETENTION_INTERVAL_SWA",
+                value,
+                spec_method=spec_method,
             )
-            assert result.returncode == expected, (value, result.stderr)
+            assert result.returncode == 2, (launcher, value, spec_method, result.stdout)
+            assert "SPEC_METHOD=dflash" in result.stderr, (launcher, value, spec_method)
 
 
 
@@ -257,5 +400,9 @@ if __name__ == "__main__":
     test_kv_capacity_log_flag()
     test_mixed_prefill_contract()
     test_thin_decode_flag_rejects_bad_values_before_host_actions()
-    test_tp4_rejects_retention_override()
+    test_kda_bf16_large_m_flag_rejects_bad_values_before_host_actions()
+    test_tp3_kda_bf16_large_m_flag_is_0_or_1()
+    for _launcher in RETENTION_LAUNCHERS:
+        test_global_retention_interval_contract(_launcher)
+        test_swa_retention_interval_needs_the_dflash_drafter(_launcher)
     print("numeric config tests: PASS")

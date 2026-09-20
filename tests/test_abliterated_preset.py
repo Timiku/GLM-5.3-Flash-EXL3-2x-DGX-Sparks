@@ -20,6 +20,9 @@ CONTROLLED_ENV = {
     "SPEC_METHOD",
     "HF_HOME",
     "WORKER_HOME",
+    # start.sh clears ABLIT after sourcing .env, so an inherited value would
+    # leak into the caller-export cases below.
+    "ABLIT",
 }
 
 
@@ -66,6 +69,13 @@ def test_wrapper_selects_preset_and_forwards_arguments() -> None:
 
 
 def test_preset_is_pinned_and_preserves_regular_serve_settings() -> None:
+    """Preset pins repo/revision/inventory; a stale `.env` ABLIT never opts in.
+
+    start.sh clears ``ABLIT`` right after sourcing ``.env`` because the
+    abliterated preset's checkpoint already carries the o_proj transplant (a
+    second edit would serve a different model). Only a caller export survives
+    that clear, and the preset then forces it back off over any caller value.
+    """
     probe = r'''
 printf '%s\n' "$MODEL" "$MODEL_FALLBACK" "$MODEL_REVISION" "$MODEL_SNAPSHOT"
 printf '%s\n' "$MODEL_CACHE_NAME" "$MODEL_FALLBACK_CACHE_NAME" "$ABLIT" "$PORT"
@@ -89,6 +99,19 @@ printf '%s\n' "$EXPECTED_SHARDS"
             script, {"GLM53_MODEL_PRESET": "abliterated", "EXPECTED_SHARDS": "1"}
         )
         regular = _run(script, {"GLM53_MODEL_PRESET": "", "EXPECTED_SHARDS": "1"})
+        # The documented opt-in for the regular checkpoint: `ABLIT=1 ./start.sh`.
+        opted_in = _run(
+            script,
+            {"GLM53_MODEL_PRESET": "", "EXPECTED_SHARDS": "1", "ABLIT": "1"},
+        )
+        empty = _run(
+            script,
+            {"GLM53_MODEL_PRESET": "", "EXPECTED_SHARDS": "1", "ABLIT": ""},
+        )
+        preset_opt_in = _run(
+            script,
+            {"GLM53_MODEL_PRESET": "abliterated", "EXPECTED_SHARDS": "1", "ABLIT": "1"},
+        )
 
     assert selected.returncode == 0, selected.stderr
     assert selected.stdout.splitlines() == [
@@ -108,7 +131,27 @@ printf '%s\n' "$EXPECTED_SHARDS"
         "wrong/fallback",
         "wrong",
     ]
-    assert regular.stdout.splitlines()[-3:] == ["1", "9123", "1"]
+    # `.env` ABLIT=1 is cleared: the launcher default keeps runtime abliteration
+    # off unless the caller exported the flag.
+    assert regular.stdout.splitlines()[-3:] == ["0", "9123", "1"]
+    assert opted_in.returncode == 0, opted_in.stderr
+    assert opted_in.stdout.splitlines()[-3:] == ["1", "9123", "1"]
+    # An explicitly empty caller value is not an opt-in either.
+    assert empty.returncode == 0, empty.stderr
+    assert empty.stdout.splitlines()[-3:] == ["0", "9123", "1"]
+    # The preset's weights are already abliterated, so it stays off even then.
+    assert preset_opt_in.returncode == 0, preset_opt_in.stderr
+    assert preset_opt_in.stdout.splitlines() == [
+        MODEL,
+        MODEL,
+        REVISION,
+        REVISION,
+        CACHE,
+        CACHE,
+        "0",
+        "9123",
+        "120",
+    ]
 
 
 def _make_snapshot(repo: Path, revision: str, shards: int = 120) -> None:

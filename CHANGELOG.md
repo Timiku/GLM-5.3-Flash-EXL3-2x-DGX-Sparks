@@ -87,6 +87,17 @@ There were no git tags for 1.0.0–1.4.0; 1.5.0 is the first cut named as a rele
   on both nodes before `docker run`. Kill switches `GLM53_COLD_LOAD_UMA=0`,
   `GLM53_COLD_LOAD_STAGE_MMAP=0`.
 
+- Experimental TP2/SM121 KDA large-M BF16 prefill path
+  (`GLM53_KDA_BF16_LARGE_M`, default `0`): uses retained FP8-derived BF16
+  weights for scheduled M > 512, with approximately 3.26 GiB extra retained
+  weights per rank. BF16-only eligibility fails closed at load; smaller
+  matrices keep Marlin. See `docs/kda-bf16-large-m.md` for qualification,
+  numerical uncertainty, and memory/cache tradeoffs. (#233)
+- Same opt-in on TP=3: `start-tp3.sh` validates `0`/`1` and forwards the
+  flag to all three ranks (FAST/FAT stay unset). Overlay retains the
+  TP3-local `[8726x4096]` in_proj after the 64→66 head pad (~2.26 GiB/rank
+  theoretical; live boot 34/34 layers at +68.2 MiB/rank). Fail-closed on
+  any other world size or shape. Serving-speed receipts remain TP2-only.
 - Opt-in bounded final sparse-MLA attention call for TP=4
   (`VLLM_SM120_SPARSE_MLA_SLICE_TOKENS`, default `0`): `overlay/patch_sparse_mla_slice.py`
   slices the final `flashinfer_trtllm_batch_decode_with_kv_cache_mla` call into
@@ -135,6 +146,9 @@ There were no git tags for 1.0.0–1.4.0; 1.5.0 is the first cut named as a rele
   the same pointer tables and takes the same paths it did before, so a generated
   TP2/TP3 adapter is unchanged, and both generators still refuse any other
   content. `docs/cooperative-moe-handoff.md` records the new pin.
+- Repinned those generators again after the KDA large-M path gained the
+  TP3-local `[8726x4096]` shape. With `GLM53_KDA_BF16_LARGE_M` unset the
+  module still takes the existing Marlin/base paths.
 
 ## [1.6.0] — 2026-09-17
 

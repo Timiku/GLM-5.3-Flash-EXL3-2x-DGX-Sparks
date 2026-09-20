@@ -58,9 +58,10 @@ Pins (`extensions/cooperative_moe/prepare_profile.py`):
 | generated overlay (stock + footer) | `5f28f5543629043117c7506cd3cf47cc8fa66fcd1153ddf67c696bf3e5484c4d` |
 
 The rows above are the C1 deployment (2026-09-16). The generator's source pin has
-since moved to `7677ab42f4a20698371b5c22d27ecb1b0b416a6860d00a137e13f25e9fd0ed40`
-(thin-decode additions to `overlay/exl3.py`, inert with `GLM53_EXL3_MOE_FAST`
-unset): regenerate the overlay with `prepare_profile.py` before the next deploy.
+since moved to `849e25882ab7901fbdd7227990a4f125809e1f79288ce6506311b6e6a53e6fb2`
+(thin-decode + KDA large-M BF16 TP2/TP3 additions to `overlay/exl3.py`, inert
+with those flags unset): regenerate the overlay with `prepare_profile.py`
+before the next deploy.
 
 The overlay footer `run_path`s `/root/.cache/vllm/cooperative_moe/runtime.py`.
 Changing geometry is a `runtime.py` copy to **both** caches plus restart. It

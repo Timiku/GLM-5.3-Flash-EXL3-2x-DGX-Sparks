@@ -9,13 +9,12 @@ import argparse
 import hashlib
 from pathlib import Path, PurePosixPath
 
-# Reviewed repin (thin-decode split from #182): overlay/exl3.py gained the opt-in
-# GLM53_EXL3_MOE_FAST dispatch and its fail-closed load gates. With the flag unset
-# the module builds the same pointer tables as before (the gate/up SUH alias is
-# created only in fast mode, and it is content-identical by the load-time per-expert
-# torch.equal proof), so a generated profile behaves as it did. Refusal on any
-# further drift is unchanged.
-STOCK_SHA = "7677ab42f4a20698371b5c22d27ecb1b0b416a6860d00a137e13f25e9fd0ed40"
+# Reviewed repin: overlay/exl3.py gained the opt-in GLM53_EXL3_MOE_FAST
+# dispatch (#217) and the KDA large-M BF16 path (#233, TP2+TP3). With both
+# flags unset the module builds the same pointer tables and takes the same
+# Marlin paths as before, so a generated profile behaves as it did. Refusal
+# on any further drift is unchanged.
+STOCK_SHA = "849e25882ab7901fbdd7227990a4f125809e1f79288ce6506311b6e6a53e6fb2"
 BINARY_SHA = "aa3fe5e9387c7e0d42d685fb2ca8a5fb959ad956600236baac078a9076c17a1c"
 ADAPTER_SHA = "9427f6a65def09ebdbea231e42f735236e145f3d02c19cf5e5276c2e704ce1ca"
 
