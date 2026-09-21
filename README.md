@@ -492,6 +492,45 @@ toward 7168 if you need document-grade detail from single images, and watch
 **NVFP4 KV is not available here.** FlashInfer’s SM12x NVFP4 kernels are dense MHA,
 not sparse MLA. Do not confuse that with NVFP4 **weights** (`--moe-backend marlin`).
 
+### Experimental compact DFlash2 cache pages
+
+`GLM53_DRAFT_KV_COMPACT=1` reduces the block IDs reserved by the drafter's
+padded slot-shared cache. Default `0` keeps 64-token padded blocks. The
+TP2/TP3/TP4 launchers accept exactly `0` or `1`; this is a startup setting.
+It changes neither weight nor KV precision, the sliding window, nor the
+target cache groups. The PR233 KDA path is independent and unchanged.
+
+The block size is derived from the actual cache geometry: the largest
+multiple of 64 that divides the MLA block and fits inside its physical
+page. Divisibility preserves prefix-cache alignment. For example, a
+3,584-token MLA block at 656 bytes/token and a 2,048-byte/token draft
+selects 896 tokens, not a fixed size borrowed from another deployment.
+With a 2,048-token window and 2,048 in-flight tokens, the pinned allocator's
+draft admission bound drops from **65 to 6 block IDs per request**.
+This is a **CPU allocator result, not a serving benchmark**: backing
+tensor allocations and the total pool block count are unchanged.
+
+Padded pages must not be split into smaller kernel blocks. Backend setup
+rejects that combination; use a backend supporting the full derived block
+(the pinned `FLASH_ATTN` backend declares multiples of 16), or disable the
+option. Unpadded exact-fit pages retain their existing behavior.
+GPU correctness, draft acceptance, prefix reuse, and throughput remain
+unqualified. Do not increase concurrency or batching based on this bound alone.
+
+CPU verification, using pristine
+[vLLM `487ecf187`](https://github.com/vllm-project/vllm/tree/487ecf187d3dfe74d2cf6119a92881dba403c219)
+sources (the three required files and hashes are listed in the test):
+
+```bash
+GLM53_VLLM_SRC=/path/to/vllm-source python3 -m pytest -q tests/test_draft_kv_compact.py
+```
+
+No torch import or model is needed. Without the source path, the two
+geometry/configuration tests run and the three pinned-source tests skip.
+The direction was motivated by
+[Alexbob0's draft-page sizing work](https://github.com/Alexbob0/glm53-flash-vllm-upstream-sm121/blob/9bf39c3e84194a57c630a42c0d79066159a5b787/overlay/patch_kv_drafter_group.py#L64-L83);
+the geometry-derived selection and backend guard here are specific to this recipe.
+
 ## Prefix caching (this kit, 2026-08-30)
 
 `--enable-prefix-caching` is on. The OpenAI API is **stateless**: the client
@@ -1079,6 +1118,7 @@ that are now documented/enforced:
 | `GLM53_SUPPRESS_STOPS_IN_REASONING` | `1` | ignore client `stop` strings until `</think>` (thinking-on default) |
 | `GLM53_DEFAULT_REASONING_EFFORT` | *(empty)* | `low` / `high` / `max` via `--default-chat-template-kwargs` on both ranks. Empty sends no flag, so omitted effort renders Max. Per-request `chat_template_kwargs.reasoning_effort` overrides the default; `medium` is rejected because the template maps it to Max |
 | `GLM53_INDEXER_WORKSPACE` | `rightsize` (default since 2026-09-07; was `stock`) | sparse-indexer prefill gather workspace. `stock` = `max_model_len * 40` entries (**5036.40 MB** locked at 1M — measured, `VLLM_DEBUG_WORKSPACE=1`). `rightsize` = the legal per-step maximum `min(MAX_NUM_SEQS, MNBT) * cdiv(MAX_MODEL_LEN + k, index_kpool)` = 126 MB at `MAX_NUM_SEQS=4` / 504 MB at 16, so **~+26–28% KV**. Opt-in; see [docs/DESIGN-indexer-workspace.md](docs/DESIGN-indexer-workspace.md) |
+| `GLM53_DRAFT_KV_COMPACT` | `0` | Experimental geometry-derived DFlash2 cache blocks; no additional quantization. Reduces shared block-ID demand, not allocated tensor bytes. Requires an unsplit padded page; CPU-verified only. See [compact draft pages](#experimental-compact-dflash2-cache-pages) |
 | `GLM53_SPINWAIT_MS` | `stock` | SpinCondition reader busy-loop window. `stock` preserves vLLM's 1 s default; `1..1000` selects milliseconds. A frozen TP=2 sweep selected `16` (+0.95% median decode vs stock, 85.3% less active EngineCore CPU) |
 | `GLM53_BOOT_SHAPE_WARMUP` | `1` | after `/health`, burn DFlash2 BLOCK / sampler / kpool shapes (nonfatal) |
 | `TRITON_HOST_CACHE` / `TILELANG_HOST_CACHE` | `$CACHE_ROOT/triton` / `tilelang` | persist JIT caches across container recreate |
@@ -1238,7 +1278,8 @@ After CUDA compile, Python overlay edits (`overlay/exl3.py`, tests) are a cheap 
 | `overlay/dflash2_speculator.py` | DFlash2 selector walk (V2 speculator) |
 | `overlay/patch_dflash2.py` | registry + `decoder_layer_cls` + speculator dispatch + draft KV `auto` on MLA/FP8 |
 | `overlay/patch_glm_eagle3.py` | Glm5Next EAGLE3 aux-hidden layers (mHC `hc_post` + contract) |
-| `overlay/patch_glm5_drafter_group.py` | GLM KV fast path + DFlash2 padded slot-share (`block=64`, `page_size_padded=mla_page`); runtime-mounted by `start.sh` (`DRAFTER_PATCH_HOST`) |
+| `overlay/patch_glm5_drafter_group.py` | GLM KV fast path + DFlash2 padded slot-sharing; 64-token default, optional geometry-derived block size, and worker-side split guard. Runtime-mounted through `DRAFTER_PATCH_HOST` |
+| `tests/test_draft_kv_compact.py` | CPU geometry/alignment checks and pinned-source allocator, backend rejection, idempotence, and two-file preflight tests |
 | `overlay/patch_glm_video_placeholders.py` | align video timestamp blocks to encoder `grid_t` |
 | `overlay/patch_suppress_stops_in_reasoning.py` | fail-closed detokenizer guard: client `stop` dormant until `</think>` |
 | `overlay/patch_scheduler_decode_floor.py` | skip / cap / off / `fair` mixed-prefill; v5 fixed-cost step fit + largest step-fitting chunk + bounded contention credit, decode first; versioned installer |

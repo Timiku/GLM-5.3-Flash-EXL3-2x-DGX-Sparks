@@ -87,6 +87,11 @@ There were no git tags for 1.0.0–1.4.0; 1.5.0 is the first cut named as a rele
   on both nodes before `docker run`. Kill switches `GLM53_COLD_LOAD_UMA=0`,
   `GLM53_COLD_LOAD_STAGE_MMAP=0`.
 
+- Experimental compact DFlash2 KV pages (`GLM53_DRAFT_KV_COMPACT`, default
+  `0`): derive a page-fitting divisor of the MLA block to reduce draft
+  block-ID demand without changing precision or backing allocations.
+  Reject padded-page kernel splitting during backend setup. CPU allocator
+  and launcher verification only; GPU behavior and performance remain unqualified.
 - Experimental TP2/SM121 KDA large-M BF16 prefill path
   (`GLM53_KDA_BF16_LARGE_M`, default `0`): uses retained FP8-derived BF16
   weights for scheduled M > 512, with approximately 3.26 GiB extra retained

@@ -441,6 +441,8 @@ GLM53_APC_NO_STORE="${GLM53_APC_NO_STORE-1}"
 # explicitly empty value is an operator error and validate_numeric_config
 # rejects it rather than guessing a serving mode.
 GLM53_INDEXER_WORKSPACE="${GLM53_INDEXER_WORKSPACE-rightsize}"
+# Opt-in larger draft KV pages; no weight or cache precision changes.
+GLM53_DRAFT_KV_COMPACT="${GLM53_DRAFT_KV_COMPACT-0}"
 # SpinCondition reader busy-loop window. "stock" preserves vLLM's 1 s default;
 # 1..1000 selects milliseconds. The frozen TP=2 sweep selected 16 ms.
 GLM53_SPINWAIT_MS="${GLM53_SPINWAIT_MS-stock}"
@@ -686,6 +688,7 @@ validate_numeric_config() {
     fi
     _glm53_validate_enum GLM53_INDEXER_WORKSPACE "${GLM53_INDEXER_WORKSPACE-rightsize}" \
         stock rightsize || return
+    _glm53_validate_bool_flag GLM53_DRAFT_KV_COMPACT "${GLM53_DRAFT_KV_COMPACT-0}" || return
     _glm53_validate_bool_flag GLM53_EXL3_MOE_FAST "${GLM53_EXL3_MOE_FAST-0}" || return
     _glm53_validate_bool_flag GLM53_KDA_BF16_LARGE_M "${GLM53_KDA_BF16_LARGE_M-0}" || return
     _glm53_validate_spinwait_ms || return
@@ -2034,6 +2037,7 @@ launch_cluster() {
         -e "GLM53_EXPOSE_CACHE_RESET=$GLM53_EXPOSE_CACHE_RESET"
         -e "GLM53_DEFAULT_REASONING_EFFORT=${GLM53_DEFAULT_REASONING_EFFORT-}"
         -e "GLM53_INDEXER_WORKSPACE=$GLM53_INDEXER_WORKSPACE"
+        -e "GLM53_DRAFT_KV_COMPACT=$GLM53_DRAFT_KV_COMPACT"
         -e "GLM53_SPINWAIT_MS=$GLM53_SPINWAIT_MS"
         -e "TRITON_CACHE_DIR=$TRITON_CACHE_DIR"
         -e "TILELANG_CACHE_DIR=$TILELANG_CACHE_DIR"
