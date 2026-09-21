@@ -14,7 +14,8 @@ The storage namespace (the fence):
 `digest` is sha256 over a canonical field map (_fence_fields) covering
 everything that changes the *meaning* of stored KV bytes: model id, resolved
 weights revision, per-block KV bytes, hash/chunk geometry, parallel sizes, per-group
-block sizes + layer names, engine version, recipe stamp, layout format. The
+block sizes + layer names, engine version, recipe stamp, layout format, and
+(FENCE_VERSION 2) the numerics-path env knobs actually set in the environment. The
 same map lands in config.json beside the data and is READ BACK at init: a
 pre-existing directory whose sidecar disagrees is a boot error (fail closed);
 data files without a sidecar are a boot error; a boot that resolves no
@@ -76,7 +77,7 @@ logger = init_logger(__name__)
 
 FORMAT_TAG = "nvme-direct/v1"
 SIDE_CAR = "config.json"
-FENCE_VERSION = 1
+FENCE_VERSION = 2
 _GSUF = re.compile(r"_g(\d+)\.bin$")
 
 
@@ -128,6 +129,27 @@ def _fence_fields(config: OffloadingConfig, revision: str) -> dict[str, Any]:
     # path; a model_name in the config (launcher passes $MODEL) keeps the
     # namespace and sidecar readable and topology-independent.
     name = str(config.extra_config.get("model_name") or config.model.name)
+    # Numerics-path env knobs (v2): these change what KV bytes MEAN for the
+    # model (attention path / drafter layout) but not the structural fields
+    # above — measured 09-21: KDA-on and KDA-off boots shared one namespace
+    # across wave arms. Only knobs actually SET in the environment land in
+    # the digest: unset -> "unset" everywhere, so a plain main/stock boot
+    # keeps the same digest it had under v1. Anything that reaches the
+    # container's env from start.sh's pass-through list participates.
+    num = {
+        k: os.environ.get(k, "unset")
+        for k in (
+            "GLM53_KDA_BF16_LARGE_M",
+            "GLM53_ADAPTIVE_K",
+            "GLM53_ADAPTIVE_K_SET",
+            "GLM53_DRAFT_KV_COMPACT",
+            "GLM53_SENS8_ROUTER",
+            "GLM53_EXL3_MOE_FAST",
+            "GLM53_EXL3_FAT_PREFILL",
+            "GLM53_DENSE_FP8",
+            "VLLM_SM120_SPARSE_MLA_SLICE_TOKENS",
+        )
+    }
     groups = [
         {
             "tokens_per_block": int(g.tokens_per_block),
@@ -149,6 +171,7 @@ def _fence_fields(config: OffloadingConfig, revision: str) -> dict[str, Any]:
         "groups": groups,
         "engine": engine,
         "stamp": _env_or_none("GLM53_RECIPE_STAMP") or "unknown",
+        "numerics": num,
         "format": FORMAT_TAG,
     }
 
