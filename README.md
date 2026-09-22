@@ -23,7 +23,7 @@ A **3×** sibling is `./start-tp3.sh` on the same image and weights (see
 
 ## Lab fork addendum — what this branch changes vs upstream, with receipts
 
-This checkout runs branch `lab/nvme-prefix` (13 commits on top of upstream
+This checkout runs branch `lab/nvme-prefix` (as of 2026-09-22, on top of upstream
 `main` `775a58b`; full text in [CHANGELOG.md](CHANGELOG.md)). Measured on the
 2-node GB10 pair, fresh boots per arm, identical prompts:
 
