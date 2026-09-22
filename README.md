@@ -19,6 +19,35 @@ A **3×** sibling is `./start-tp3.sh` on the same image and weights (see
 [3× Spark (TP=3)](#3x-spark-tp3)). Served model id: **`GLM-5.3-Flash-EXL3`**. EXL3/TR3 quant by
 [brandonmusic](https://huggingface.co/brandonmusic).
 
+---
+
+## Lab fork addendum — what this branch changes vs upstream, with receipts
+
+This checkout runs branch `lab/nvme-prefix` (13 commits on top of upstream
+`main` `775a58b`; full text in [CHANGELOG.md](CHANGELOG.md)). Measured on the
+2-node GB10 pair, fresh boots per arm, identical prompts:
+
+| Lever | Flag (serving state) | Measured |
+|---|---|---|
+| NVMe-direct KV prefix cache + model-keyed fence | `OFFLOAD_NVME=1` (on) | 105k-token prefix restored in **5.5 s** vs ~130 s recompute, bit-exact ids; 6x168k flood stored 76.5 GB, zero stalls; fence v2 refuses cross-config reads ([docs/nvme-prefix-fence.md](docs/nvme-prefix-fence.md)) |
+| UMA cold-load budget + mmap staging | `GLM53_COLD_LOAD_UMA` (default) | full 164 GiB checkpoint in **36 s** (4.9 GB/s drive ceiling) where stock aborted on a full page cache; launcher `GLM53_HOST_MEM_HYGIENE=1` waits for CUDA-free before `docker run` ([docs/cold-load-uma.md](docs/cold-load-uma.md)) |
+| Compact DFlash2 draft KV pages (PR #238, adopted) | `GLM53_DRAFT_KV_COMPACT=1` (**on**) | KV pool **883,552 -> 1,593,389 tokens (+80%)** at the same memory; 532 -> 295 block ids per 850k-token request; decode within noise (30.98 -> 29.97 tok/s prose), acceptance 3.9 -> 4.0 tok/step |
+| KDA large-M BF16 prefill (upstream #233/#237, enabled here) | `GLM53_KDA_BF16_LARGE_M=1` (**on**) | cold 16k-class prefill TTFT **15.68 -> 12.73 s (-18.8% median)**, decode-neutral; long-context PPL **+0.078%** (wikitext-103, 122,814 tokens, same sequences both arms) |
+| Indexer warmup-range widening (#203 adapted) | baked | removes a real mid-serve Triton compile bucket (+~2 min boot); cold-cache insurance, no serving delta while the persistent cache stands |
+
+Comparability note: the KV-pool and footprint rows are the TP=2 shape at
+`MAX_MODEL_LEN=850000` with the NVMe offload arm on. The upstream E3 prefill
+table further below reports a different kit configuration (1M window, no
+offload arm) and its absolute numbers are not directly comparable to these.
+
+Defaults in `.env.example` and in code stay off/neutral; the flags marked
+**on** are this rig's untracked `.env` choices. Bench tooling and raw
+receipts: `~/glm53-lab/` on the head node. Upstream branches and tags ride
+along untouched; the lab's own history branches (`kvoffload-lab`,
+`lab/cold-load`) are ancestors of this one.
+
+---
+
 Optional TP3 contribution for evaluation: [cooperative ABI2, 64-row support,
 FlashKDA and combined-profile measurements](docs/tp3-throughput-results.md).
 Historical measurements and pending validation of the upstream-based branch
