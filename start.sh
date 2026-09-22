@@ -1045,6 +1045,27 @@ preflight_memory() {
     fi
     echo "PREFLIGHT OK [$label]: MemAvailable=${available_gib}/${total_gib} GiB; request=${requested_gib} GiB plus ${headroom_gib} GiB headroom"
 }
+# GLM53 InstantTensor KV-fit note (begin)
+# The direct-I/O loader leaves ~4.4-5.6 GiB less for the KV pool than vLLM auto on a 2x GB10
+# kit (measured 12.4-12.5 GiB available vs 13.46 GiB needed for one 850k request; #204). At the
+# stock share with no explicit pool size the engine refuses to boot, ~5-9 minutes in. Say so up
+# front. Diagnostic only: nothing here changes a value, and vLLM still makes the real decision.
+preflight_instanttensor_kv_note() {
+    local load_format="$1" max_model_len="$2" util="$3" extra_args="$4"
+    [ "$load_format" = "instanttensor" ] || return 0
+    [[ "$max_model_len" =~ ^[0-9]+$ ]] && [ "$max_model_len" -ge 850000 ] || return 0
+    [[ "$util" =~ ^(0([.][0-9]+)?|[.][0-9]+|1([.]0+)?)$ ]] || return 0
+    # Portability hardening (#242): pin C for this comparison so an ambient comma-decimal
+    # LC_NUMERIC cannot move the cut, whatever the installed awk does with `-v` numbers.
+    LC_ALL=C awk -v u="$util" 'BEGIN { exit !(u <= 0.85) }' || return 0
+    local _tok
+    # shellcheck disable=SC2086
+    for _tok in $extra_args; do
+        case "$_tok" in --kv-cache-memory-bytes|--kv-cache-memory-bytes=*) return 0 ;; esac
+    done
+    warn "NOTE: LOAD_FORMAT=instanttensor at MAX_MODEL_LEN=${max_model_len} with GPU_MEM_UTIL=${util} has been measured NOT to boot on 2x GB10 (KV needs 13.46 GiB, ~12.4 available); add --kv-cache-memory-bytes 15032385536 to EXTRA_ARGS, keeping any flags already there (see .env.example), or set LOAD_FORMAT= (slower load). #204"
+}
+# GLM53 InstantTensor KV-fit note (end)
 # GLM53 preflight memory guard (end)
 
 trap 'warn "interrupted — containers keep running ('"'"'./start.sh logs'"'"' to watch, '"'"'./start.sh stop'"'"' to stop)"; exit 130' INT
@@ -1127,6 +1148,7 @@ preflight() {
     read -r worker_total worker_available <<< "$worker_mem"
     preflight_memory head "$head_total" "$head_available" "$GPU_MEM_UTIL" || return
     preflight_memory worker "$worker_total" "$worker_available" "$GPU_MEM_UTIL" || return
+    preflight_instanttensor_kv_note "${LOAD_FORMAT:-}" "${MAX_MODEL_LEN:-}" "${GPU_MEM_UTIL:-}" "${EXTRA_ARGS:-}"
 
     [ -f "$STOP_PATCH_HOST" ] || die "$STOP_PATCH_HOST missing"
     [ -f "$SCHED_PATCH_HOST" ] || die "$SCHED_PATCH_HOST missing"

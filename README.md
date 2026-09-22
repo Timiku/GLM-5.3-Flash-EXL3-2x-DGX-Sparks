@@ -107,7 +107,7 @@ run-to-run spread). Isolated layer bench: 7168-token MoE layer 77–91 ms (E2) �
 numerically indistinguishable from E2 vs the LinearEXL3 reference. Full receipts, gates and
 the memory caveat: `logs/overnight-20260906T164059Z/report.md`.
 
-**Context and headroom:** the shipped default is now **850k / util 0.85 / rightsize** (boots with ~0.5 GiB of KV margin on the head; a 256k prefill ran at 900k / 0.87 with driver retries but no failure). E3 keeps a 560 MiB fat-row scratch that vLLM's profile run charges to
+**Context and headroom:** the shipped default is now **850k / util 0.85 / rightsize** (with `LOAD_FORMAT=` it boots with ~0.5 GiB of KV margin on the head; with the default InstantTensor loader the pool is reserved explicitly at 14 GiB via `EXTRA_ARGS`, without which 0.85 does **not** boot, see [InstantTensor and KV memory](#instanttensor-and-kv-memory); a 256k prefill ran at 900k / 0.87 with driver retries but no failure). E3 keeps a 560 MiB fat-row scratch that vLLM's profile run charges to
 the KV budget, so at 1M / util 0.87 the pool no longer fits one 1M request on this kit
 (needs 14.52 GiB). 500k needs 10.98 GiB and boots reliably at 0.84 (1.2× at 500k). Prompts
 ≥ ~100k are near the head's host-memory limit at any setting (a 256k prefill at util 0.87
@@ -685,6 +685,40 @@ a separate configuration; the all-zero results do not qualify it. See the
 [protocol, raw measurements, and limitations](docs/apc-retention-qualification.md)
 before selecting a policy or a cache budget for another kit.
 
+## InstantTensor and KV memory
+
+`LOAD_FORMAT=instanttensor` (the default on `:exl3-instanttensor`) loads the 164 GiB
+checkpoint in ~65–70 s cold and under 10 s when the files are still in page cache, versus
+~290–300 s for vLLM auto. The cost is KV pool: on a 2x GB10 kit at 850k / fp8 / rightsize it
+leaves **~12.4–12.5 GiB** available versus **~17–18 GiB** with the loader off (measured across
+three boots each; #204). One 850k request needs 13.46 GiB, so the stock `GPU_MEM_UTIL=0.85`
+does not boot with the loader on — the engine fails at KV allocation after the weights are
+already loaded. `Model loading took 79.65 GiB` is identical either way; the difference shows
+up only in `Available KV cache memory`.
+
+Three ways to run it, in the order we recommend (the first is the shipped default as of this change):
+
+| setting | KV pool | boots on 2x GB10 | notes |
+|---|---|---|---|
+| `EXTRA_ARGS="--kv-cache-memory-bytes 15032385536"` (14 GiB), share 0.85 | 883,552 tok, 1.04x | 3/3 | explicit reservation, bypasses profiling; idle host headroom same as loader-off (~5 GiB) |
+| `LOAD_FORMAT=` **and** `EXTRA_ARGS=` (clear the shipped cap), share 0.85 | ~1.07–1.14M tok | 3/3 | ~4x slower cold load; biggest pool. Keep any other `EXTRA_ARGS` you had. |
+| `GPU_MEM_UTIL=0.88`, no explicit pool | 1,017,763 tok when it boots | 1/4 | 0.88 × 121.69 = 107.09 GiB, right at the worker's CUDA-free at check time (105.8–107.1); `preflight_memory` reads `MemAvailable` and passes anyway; ~2.4 GB less host headroom when it does boot |
+
+`start.sh` prints a `NOTE` at preflight when it sees the failing combination (loader on,
+`MAX_MODEL_LEN` ≥ 850k, `GPU_MEM_UTIL` ≤ 0.85, no `--kv-cache-memory-bytes`). It is advisory
+only: it changes no value, does not fix an undersized KV pool, and does not prevent the boot
+failure — the operator still has to change the config (add the reservation, or set
+`LOAD_FORMAT=` to have vLLM auto profile the pool), and vLLM still makes the real decision.
+The check is locale-independent: the caller's `LC_NUMERIC` cannot silence it.
+
+TP=3 / TP=4 need the opposite treatment: `start-tp3.sh` / `start-tp4.sh` drop a
+`--kv-cache-memory-bytes` that comes from the shared `.env` (keeping any other flags, and
+reporting the drop), so an existing install whose reservation lives in the shared `.env` loses
+it. Pin a topology-sized value in `.env.tp3` / `.env.tp4` instead — a topology pin is not
+stripped — or pass `EXTRA_ARGS` on the command line; a caller value, including an explicit
+empty, wins over both files. Details in
+[Existing installs](#existing-installs-pull-the-instanttensor-image).
+
 ## Existing installs: pull the InstantTensor image
 
 `main` now defaults to
@@ -699,13 +733,38 @@ wheel-less image and InstantTensor will not load.
 git pull
 ```
 
-2. Set these lines in `.env` (already the default in `.env.example`; do
+2. Set these two lines in `.env` (already the default in `.env.example`; do
    the same in `.env.tp3` / `.env.tp4` if you use those):
 
 ```
 IMAGE=ghcr.io/miaai-lab/glm-5.3-flash-2x-dgx-sparks:exl3-instanttensor
 LOAD_FORMAT=instanttensor
 ```
+
+   **TP=2 only**, also make sure `.env`'s `EXTRA_ARGS` contains the reservation (it is the
+   default in `.env.example`; an existing `.env` predates it). If you already have
+   `EXTRA_ARGS`, append to it rather than replacing it:
+
+```
+EXTRA_ARGS="--kv-cache-memory-bytes 15032385536"                          # no other flags yet
+EXTRA_ARGS="--your-existing-flags --kv-cache-memory-bytes 15032385536"   # keep what you had
+```
+
+   TP=3 / TP=4 do not need it and must not rely on it, and the topology templates do not clear
+   it: `start-tp3.sh` / `start-tp4.sh` strip a `--kv-cache-memory-bytes` out of the shared
+   `.env` `EXTRA_ARGS` before the topology overlay, keeping every other flag and reporting the
+   removal — 14 GiB is sized for TP=2 at 850k and neither topology was measured with it.
+   **Existing TP=3 / TP=4 installs: if that flag is in your shared `.env`, the launcher drops
+   the reservation on the next start.** Pin a topology-sized value in `.env.tp3` / `.env.tp4`
+   instead (a topology pin is not stripped), or pass `EXTRA_ARGS` on the command line — a
+   caller value, including an explicit empty, wins over both files.
+
+   The cap is required for TP=2 at `MAX_MODEL_LEN=850000` / `GPU_MEM_UTIL=0.85`: the
+   InstantTensor loader leaves ~4.4–5.6 GiB less for the KV pool than vLLM auto, and
+   without an explicit pool size the engine refuses to boot (needs 13.46 GiB, ~12.4 GiB
+   available). Raising `GPU_MEM_UTIL` to 0.88 instead is marginal on 2x GB10 — it booted
+   1 of 4 attempts here, failing vLLM's startup free-memory check on the worker even though
+   `start.sh`'s preflight passed. Details in [InstantTensor and KV memory](#instanttensor-and-kv-memory).
 
 3. Pull that tag on the head and restart. `SKIP_BUILD=1` keeps the published
    GHCR image (do not let a recipe-stamp mismatch rebuild from this
