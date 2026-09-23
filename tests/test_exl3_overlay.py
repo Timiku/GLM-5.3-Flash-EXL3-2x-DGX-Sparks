@@ -1308,14 +1308,23 @@ def _check_dflash2() -> None:
     assert "type(v) is SlidingWindowSpec" in kv
     # Standalone DFlash2 must not inherit the 1152-token MLA manager block
     # (that doubled per-block bytes and pinned concurrency at ~1× max_len).
-    assert "compact_block = 64" in kv
+    # pr-238: the compact size is chosen at boot by _glm53_draft_block_size()
+    # (GLM53_DRAFT_KV_COMPACT), so assert the helper contract, not a literal.
+    assert "def _glm53_draft_block_size(" in kv
+    assert 'os.environ.get("GLM53_DRAFT_KV_COMPACT", "0")' in kv
+    assert "compact_block = _glm53_draft_block_size(" in kv
     assert "page_size_padded=mla_page" in kv
     assert "padded slot-share block=%d" in kv
-    assert "s.block_size != 64 or s.page_size_padded != mla_page" in kv
-    standalone = kv.split("PADDED SLOT-SHARE:")[1].split("draft_uniform")[0]
+    assert "s.block_size <= 0 or s.block_size % 64" in kv
+    standalone = kv.split("# Layer i shares MLA tensor i")[1].split("draft_uniform")[0]
     assert "compact_block" in standalone
     assert "page_size_padded=mla_page" in standalone
     assert "new_draft_specs = dict(draft_specs)" not in standalone
+    # Split guard: a padded page must never be kernel-split (pr-238 worker edit).
+    worker = Path(
+        "/usr/local/lib/python3.12/dist-packages/vllm/v1/worker/utils.py"
+    ).read_text()
+    assert "DFlash2 padded KV pages cannot be split" in worker
     src = Path("/usr/local/lib/python3.12/dist-packages/vllm/model_executor/models/qwen3_dflash.py").read_text()
     # Top-level is_causal must win so GLM-5.3-Flash-DFlash2 (is_causal=false,
     # all sliding_attention) does not silently draft as causal DFlash1.
